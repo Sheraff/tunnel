@@ -23,8 +23,10 @@ usage() {
   print -r -- "  $PROGRAM open HOST:PORT"
   print -r -- "  $PROGRAM open"
   print -r -- "  $PROGRAM reopen PORT"
+  print -r -- "  $PROGRAM reopen all"
   print -r -- "  $PROGRAM reopen"
   print -r -- "  $PROGRAM close PORT"
+  print -r -- "  $PROGRAM close all"
   print -r -- "  $PROGRAM close"
   print -r -- "  $PROGRAM prune"
 }
@@ -270,7 +272,7 @@ status_tunnels() {
   done
 }
 
-start_tunnel() {
+try_start_tunnel() {
   emulate -L zsh
   local ssh_host="$1"
   local local_port="$2"
@@ -279,13 +281,23 @@ start_tunnel() {
   local socket="$5"
   local meta="$6"
 
-  ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "$local_port:$remote_host:$remote_port" "$ssh_host" || \
-    die "failed to open tunnel $ssh_host:$local_port"
+  START_TUNNEL_ERROR=""
+
+  if ! ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "$local_port:$remote_host:$remote_port" "$ssh_host"; then
+    START_TUNNEL_ERROR="failed to open tunnel $ssh_host:$local_port"
+    return 1
+  fi
 
   if ! write_meta "$meta" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket"; then
     ssh -S "$socket" -O exit "$ssh_host" >/dev/null 2>&1
-    die "opened tunnel but failed to write metadata: $meta"
+    START_TUNNEL_ERROR="opened tunnel but failed to write metadata: $meta"
+    return 1
   fi
+}
+
+start_tunnel() {
+  emulate -L zsh
+  try_start_tunnel "$@" || die "$START_TUNNEL_ERROR"
 }
 
 open_tunnel() {
@@ -350,9 +362,67 @@ reopen_meta_file() {
     die "local port $local_port is already listening"
   fi
 
+  reopen_tunnel_record "$file" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket" || die "$START_TUNNEL_ERROR"
+}
+
+reopen_tunnel_record() {
+  emulate -L zsh
+  local file="$1"
+  local ssh_host="$2"
+  local local_port="$3"
+  local remote_host="$4"
+  local remote_port="$5"
+  local socket="$6"
+
   rm -f "$socket"
-  start_tunnel "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket" "$file"
+  try_start_tunnel "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket" "$file" || return 1
   print -r -- "Reopened $local_port -> $ssh_host:$remote_host:$remote_port"
+}
+
+reopen_all_tunnels() {
+  emulate -L zsh
+  local file ssh_host local_port remote_host remote_port socket
+  local reopened skipped failed
+
+  reopened=0
+  skipped=0
+  failed=0
+
+  for file in ${(f)"$(meta_files)"}; do
+    if ! load_meta "$file"; then
+      print -u2 -r -- "$PROGRAM: skipping invalid metadata: $file"
+      (( skipped++ ))
+      continue
+    fi
+
+    ssh_host="$META_SSH_HOST"
+    local_port="$META_LOCAL_PORT"
+    remote_host="$META_REMOTE_HOST"
+    remote_port="$META_REMOTE_PORT"
+    socket="$META_SOCKET"
+
+    if is_control_alive "$ssh_host" "$socket"; then
+      (( skipped++ ))
+      continue
+    fi
+
+    if is_port_listening "$local_port"; then
+      print -u2 -r -- "$PROGRAM: cannot reopen tunnel on local port $local_port: local port is already listening"
+      (( failed++ ))
+      continue
+    fi
+
+    if ! reopen_tunnel_record "$file" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket"; then
+      print -u2 -r -- "$PROGRAM: $START_TUNNEL_ERROR"
+      (( failed++ ))
+      continue
+    fi
+
+    (( reopened++ ))
+  done
+
+  printf "Reopened %d stale tunnel(s); skipped %d tunnel(s); failed %d tunnel(s).\n" "$reopened" "$skipped" "$failed"
+  (( failed == 0 ))
 }
 
 reopen_tunnel_by_port() {
@@ -372,18 +442,81 @@ reopen_tunnel_by_port() {
 close_meta_file() {
   emulate -L zsh
   local file="$1"
+  local ssh_host local_port remote_host remote_port socket
 
   load_meta "$file" || die "invalid metadata: $file"
 
-  if ! is_control_alive "$META_SSH_HOST" "$META_SOCKET"; then
-    die "managed tunnel on local port $META_LOCAL_PORT is not alive; run '$PROGRAM reopen $META_LOCAL_PORT' to reopen it or '$PROGRAM prune' to remove it"
+  ssh_host="$META_SSH_HOST"
+  local_port="$META_LOCAL_PORT"
+  remote_host="$META_REMOTE_HOST"
+  remote_port="$META_REMOTE_PORT"
+  socket="$META_SOCKET"
+
+  if ! is_control_alive "$ssh_host" "$socket"; then
+    die "managed tunnel on local port $local_port is not alive; run '$PROGRAM reopen $local_port' to reopen it or '$PROGRAM prune' to remove it"
   fi
 
-  ssh -S "$META_SOCKET" -O exit "$META_SSH_HOST" >/dev/null 2>&1 || \
-    die "failed to close tunnel on local port $META_LOCAL_PORT"
+  close_tunnel_record "$file" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket" || die "$CLOSE_TUNNEL_ERROR"
+}
 
-  rm -f "$file" "$META_SOCKET"
-  print -r -- "Closed $META_LOCAL_PORT -> $META_SSH_HOST:$META_REMOTE_HOST:$META_REMOTE_PORT"
+close_tunnel_record() {
+  emulate -L zsh
+  local file="$1"
+  local ssh_host="$2"
+  local local_port="$3"
+  local remote_host="$4"
+  local remote_port="$5"
+  local socket="$6"
+
+  CLOSE_TUNNEL_ERROR=""
+
+  if ! ssh -S "$socket" -O exit "$ssh_host" >/dev/null 2>&1; then
+    CLOSE_TUNNEL_ERROR="failed to close tunnel on local port $local_port"
+    return 1
+  fi
+
+  rm -f "$file" "$socket"
+  print -r -- "Closed $local_port -> $ssh_host:$remote_host:$remote_port"
+}
+
+close_all_tunnels() {
+  emulate -L zsh
+  local file ssh_host local_port remote_host remote_port socket
+  local closed skipped failed
+
+  closed=0
+  skipped=0
+  failed=0
+
+  for file in ${(f)"$(meta_files)"}; do
+    if ! load_meta "$file"; then
+      print -u2 -r -- "$PROGRAM: skipping invalid metadata: $file"
+      (( skipped++ ))
+      continue
+    fi
+
+    ssh_host="$META_SSH_HOST"
+    local_port="$META_LOCAL_PORT"
+    remote_host="$META_REMOTE_HOST"
+    remote_port="$META_REMOTE_PORT"
+    socket="$META_SOCKET"
+
+    if ! is_control_alive "$ssh_host" "$socket"; then
+      (( skipped++ ))
+      continue
+    fi
+
+    if ! close_tunnel_record "$file" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket"; then
+      print -u2 -r -- "$PROGRAM: $CLOSE_TUNNEL_ERROR"
+      (( failed++ ))
+      continue
+    fi
+
+    (( closed++ ))
+  done
+
+  printf "Closed %d live tunnel(s); skipped %d tunnel(s); failed %d tunnel(s).\n" "$closed" "$skipped" "$failed"
+  (( failed == 0 ))
 }
 
 close_tunnel_by_port() {
@@ -554,7 +687,13 @@ main() {
       require_command ssh
       case $# in
         0) interactive_reopen ;;
-        1) reopen_tunnel_by_port "$1" ;;
+        1)
+          if [[ "$1" == "all" ]]; then
+            reopen_all_tunnels
+          else
+            reopen_tunnel_by_port "$1"
+          fi
+          ;;
         *) usage_error "reopen takes zero or one argument" ;;
       esac
       ;;
@@ -562,7 +701,13 @@ main() {
       require_command ssh
       case $# in
         0) interactive_close ;;
-        1) close_tunnel_by_port "$1" ;;
+        1)
+          if [[ "$1" == "all" ]]; then
+            close_all_tunnels
+          else
+            close_tunnel_by_port "$1"
+          fi
+          ;;
         *) usage_error "close takes zero or one argument" ;;
       esac
       ;;

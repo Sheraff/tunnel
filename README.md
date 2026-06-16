@@ -33,8 +33,10 @@ tunnel status
 tunnel open HOST:PORT
 tunnel open
 tunnel reopen PORT
+tunnel reopen all
 tunnel reopen
 tunnel close PORT
+tunnel close all
 tunnel close
 tunnel prune
 ```
@@ -71,10 +73,22 @@ Close a managed tunnel by local port:
 tunnel close 5743
 ```
 
+Close all live managed tunnels:
+
+```bash
+tunnel close all
+```
+
 Reopen a stale managed tunnel:
 
 ```bash
 tunnel reopen 5743
+```
+
+Reopen all stale managed tunnels:
+
+```bash
+tunnel reopen all
 ```
 
 Remove stale metadata and socket files without touching live tunnels:
@@ -152,6 +166,10 @@ Before opening, `tunnel` refuses to continue if:
 - The local port is already listening and `lsof` is available.
 
 `tunnel list` only shows tunnels created by this tool. It does not discover arbitrary external `ssh -L` processes.
+
+`tunnel close all` closes live managed tunnels and removes their metadata, matching `tunnel close PORT`.
+
+`tunnel reopen all` only reopens stale managed tunnels that still have metadata.
 
 `tunnel prune` only removes stale metadata and socket files. It does not close live tunnels.
 
