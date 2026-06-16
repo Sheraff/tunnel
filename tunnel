@@ -22,6 +22,8 @@ usage() {
   print -r -- "  $PROGRAM status"
   print -r -- "  $PROGRAM open HOST:PORT"
   print -r -- "  $PROGRAM open"
+  print -r -- "  $PROGRAM reopen PORT"
+  print -r -- "  $PROGRAM reopen"
   print -r -- "  $PROGRAM close PORT"
   print -r -- "  $PROGRAM close"
   print -r -- "  $PROGRAM prune"
@@ -219,7 +221,7 @@ find_meta_by_port() {
 
 list_tunnels() {
   emulate -L zsh
-  local file status target
+  local file tunnel_state target
 
   printf "%-6s %-10s %-18s %s\n" "PORT" "SSH HOST" "TARGET" "STATUS"
   for file in ${(f)"$(meta_files)"}; do
@@ -229,19 +231,19 @@ list_tunnels() {
     fi
 
     if is_control_alive "$META_SSH_HOST" "$META_SOCKET"; then
-      status="open"
+      tunnel_state="open"
     else
-      status="stale"
+      tunnel_state="stale"
     fi
 
     target="$META_REMOTE_HOST:$META_REMOTE_PORT"
-    printf "%-6s %-10s %-18s %s\n" "$META_LOCAL_PORT" "$META_SSH_HOST" "$target" "$status"
+    printf "%-6s %-10s %-18s %s\n" "$META_LOCAL_PORT" "$META_SSH_HOST" "$target" "$tunnel_state"
   done
 }
 
 status_tunnels() {
   emulate -L zsh
-  local file control local_port_state status target
+  local file control local_port_state tunnel_state target
 
   printf "%-6s %-10s %-18s %-9s %-10s %s\n" "PORT" "SSH HOST" "TARGET" "CONTROL" "LOCAL PORT" "STATUS"
   for file in ${(f)"$(meta_files)"}; do
@@ -258,14 +260,32 @@ status_tunnels() {
 
     local_port_state="$(port_state "$META_LOCAL_PORT")"
     if [[ "$control" == "alive" && "$local_port_state" != "closed" ]]; then
-      status="open"
+      tunnel_state="open"
     else
-      status="stale"
+      tunnel_state="stale"
     fi
 
     target="$META_REMOTE_HOST:$META_REMOTE_PORT"
-    printf "%-6s %-10s %-18s %-9s %-10s %s\n" "$META_LOCAL_PORT" "$META_SSH_HOST" "$target" "$control" "$local_port_state" "$status"
+    printf "%-6s %-10s %-18s %-9s %-10s %s\n" "$META_LOCAL_PORT" "$META_SSH_HOST" "$target" "$control" "$local_port_state" "$tunnel_state"
   done
+}
+
+start_tunnel() {
+  emulate -L zsh
+  local ssh_host="$1"
+  local local_port="$2"
+  local remote_host="$3"
+  local remote_port="$4"
+  local socket="$5"
+  local meta="$6"
+
+  ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "$local_port:$remote_host:$remote_port" "$ssh_host" || \
+    die "failed to open tunnel $ssh_host:$local_port"
+
+  if ! write_meta "$meta" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket"; then
+    ssh -S "$socket" -O exit "$ssh_host" >/dev/null 2>&1
+    die "opened tunnel but failed to write metadata: $meta"
+  fi
 }
 
 open_tunnel() {
@@ -296,7 +316,7 @@ open_tunnel() {
   done
 
   (( alive_count == 0 )) || die "local port $local_port is already used by a managed tunnel"
-  (( stale_count == 0 )) || die "stale metadata exists for local port $local_port; run '$PROGRAM prune'"
+  (( stale_count == 0 )) || die "stale metadata exists for local port $local_port; run '$PROGRAM reopen $local_port' to reopen it or '$PROGRAM prune' to remove it"
 
   if [[ -e "$meta" || -e "$socket" ]]; then
     die "metadata or socket already exists for $ssh_host:$local_port; run '$PROGRAM prune' if it is stale"
@@ -306,15 +326,47 @@ open_tunnel() {
     die "local port $local_port is already listening"
   fi
 
-  ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "$local_port:$remote_host:$remote_port" "$ssh_host" || \
-    die "failed to open tunnel $ssh_host:$local_port"
+  start_tunnel "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket" "$meta"
+  print -r -- "Opened $local_port -> $ssh_host:$remote_host:$remote_port"
+}
 
-  if ! write_meta "$meta" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket"; then
-    ssh -S "$socket" -O exit "$ssh_host" >/dev/null 2>&1
-    die "opened tunnel but failed to write metadata: $meta"
+reopen_meta_file() {
+  emulate -L zsh
+  local file="$1"
+  local ssh_host local_port remote_host remote_port socket
+
+  load_meta "$file" || die "invalid metadata: $file"
+  ssh_host="$META_SSH_HOST"
+  local_port="$META_LOCAL_PORT"
+  remote_host="$META_REMOTE_HOST"
+  remote_port="$META_REMOTE_PORT"
+  socket="$META_SOCKET"
+
+  if is_control_alive "$ssh_host" "$socket"; then
+    die "managed tunnel on local port $local_port is already open"
   fi
 
-  print -r -- "Opened $local_port -> $ssh_host:$remote_host:$remote_port"
+  if is_port_listening "$local_port"; then
+    die "local port $local_port is already listening"
+  fi
+
+  rm -f "$socket"
+  start_tunnel "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket" "$file"
+  print -r -- "Reopened $local_port -> $ssh_host:$remote_host:$remote_port"
+}
+
+reopen_tunnel_by_port() {
+  emulate -L zsh
+  local port="$1"
+
+  validate_port "$port" || usage_error "port must be numeric and between 1 and 65535"
+
+  find_meta_by_port "$port"
+  case ${#FOUND_META_FILES[@]} in
+    0) die "no managed tunnel uses local port $port" ;;
+    1) reopen_meta_file "${FOUND_META_FILES[1]}" ;;
+    *) die "multiple managed tunnels use local port $port; run '$PROGRAM reopen' and choose one" ;;
+  esac
 }
 
 close_meta_file() {
@@ -324,7 +376,7 @@ close_meta_file() {
   load_meta "$file" || die "invalid metadata: $file"
 
   if ! is_control_alive "$META_SSH_HOST" "$META_SOCKET"; then
-    die "managed tunnel on local port $META_LOCAL_PORT is not alive; run '$PROGRAM prune'"
+    die "managed tunnel on local port $META_LOCAL_PORT is not alive; run '$PROGRAM reopen $META_LOCAL_PORT' to reopen it or '$PROGRAM prune' to remove it"
   fi
 
   ssh -S "$META_SOCKET" -O exit "$META_SSH_HOST" >/dev/null 2>&1 || \
@@ -395,7 +447,7 @@ interactive_open() {
 
 interactive_close() {
   emulate -L zsh
-  local file choice index
+  local file choice
   local -a files
 
   files=()
@@ -413,6 +465,29 @@ interactive_close() {
   (( choice >= 1 && choice <= ${#files[@]} )) || usage_error "selection out of range"
 
   close_meta_file "${files[$choice]}"
+}
+
+interactive_reopen() {
+  emulate -L zsh
+  local file choice
+  local -a files
+
+  files=()
+  for file in ${(f)"$(meta_files)"}; do
+    load_meta "$file" || continue
+    is_control_alive "$META_SSH_HOST" "$META_SOCKET" && continue
+    files+=("$file")
+    printf "%d) %-6s %s -> %s:%s\n" ${#files[@]} "$META_SSH_HOST" "$META_LOCAL_PORT" "$META_REMOTE_HOST" "$META_REMOTE_PORT"
+  done
+
+  (( ${#files[@]} > 0 )) || die "no stale managed tunnels to reopen"
+  print -r -- ""
+  read "choice?Reopen which tunnel? " || exit 1
+
+  [[ "$choice" == <-> ]] || usage_error "selection must be numeric"
+  (( choice >= 1 && choice <= ${#files[@]} )) || usage_error "selection out of range"
+
+  reopen_meta_file "${files[$choice]}"
 }
 
 prune_tunnels() {
@@ -470,6 +545,14 @@ main() {
         0) interactive_open ;;
         1) open_tunnel "$1" ;;
         *) usage_error "open takes zero or one argument" ;;
+      esac
+      ;;
+    reopen)
+      require_command ssh
+      case $# in
+        0) interactive_reopen ;;
+        1) reopen_tunnel_by_port "$1" ;;
+        *) usage_error "reopen takes zero or one argument" ;;
       esac
       ;;
     close)
