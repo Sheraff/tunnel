@@ -1,0 +1,494 @@
+#!/usr/bin/env zsh
+
+emulate -R zsh
+setopt no_nomatch
+
+PROGRAM=${0:t}
+
+die() {
+  print -u2 -r -- "$PROGRAM: $*"
+  exit 1
+}
+
+usage_error() {
+  print -u2 -r -- "$PROGRAM: $*"
+  print -u2 -r -- "Run '$PROGRAM help' for usage."
+  exit 2
+}
+
+usage() {
+  print -r -- "Usage:"
+  print -r -- "  $PROGRAM list"
+  print -r -- "  $PROGRAM status"
+  print -r -- "  $PROGRAM open HOST:PORT"
+  print -r -- "  $PROGRAM open"
+  print -r -- "  $PROGRAM close PORT"
+  print -r -- "  $PROGRAM close"
+  print -r -- "  $PROGRAM prune"
+}
+
+require_command() {
+  emulate -L zsh
+  local name="$1"
+  command -v "$name" >/dev/null 2>&1 || die "$name is required"
+}
+
+runtime_dir() {
+  emulate -L zsh
+  local user_name="${USER:-$(id -un)}"
+  print -r -- "${XDG_RUNTIME_DIR:-/tmp}/tunnel-$user_name"
+}
+
+ensure_runtime_dir() {
+  emulate -L zsh
+  local dir
+  dir="$(runtime_dir)"
+  mkdir -p -m 700 "$dir" || die "failed to create runtime directory: $dir"
+}
+
+safe_name() {
+  emulate -L zsh
+  local host="$1"
+  local port="$2"
+  local safe_host="${host//[^A-Za-z0-9_.-]/_}"
+  print -r -- "$safe_host-$port"
+}
+
+socket_path() {
+  emulate -L zsh
+  local host="$1"
+  local port="$2"
+  print -r -- "$(runtime_dir)/$(safe_name "$host" "$port").sock"
+}
+
+meta_path() {
+  emulate -L zsh
+  local host="$1"
+  local port="$2"
+  print -r -- "$(runtime_dir)/$(safe_name "$host" "$port").meta"
+}
+
+validate_port() {
+  emulate -L zsh
+  local port="$1"
+
+  [[ "$port" == <-> ]] || return 1
+  (( port >= 1 && port <= 65535 )) || return 1
+  return 0
+}
+
+parse_host_port() {
+  emulate -L zsh
+  local spec="$1"
+  local host port
+
+  [[ "$spec" == *:* ]] || usage_error "expected HOST:PORT"
+  [[ "$spec" != *:*:* ]] || usage_error "only HOST:PORT syntax is supported"
+
+  host="${spec%%:*}"
+  port="${spec#*:}"
+
+  [[ -n "$host" ]] || usage_error "host must not be empty"
+  validate_port "$port" || usage_error "port must be numeric and between 1 and 65535"
+
+  PARSED_HOST="$host"
+  PARSED_PORT="$port"
+}
+
+reset_meta() {
+  emulate -L zsh
+  META_SSH_HOST=""
+  META_LOCAL_PORT=""
+  META_REMOTE_HOST=""
+  META_REMOTE_PORT=""
+  META_SOCKET=""
+  META_CREATED_AT=""
+}
+
+load_meta() {
+  emulate -L zsh
+  local file="$1"
+  local line key value
+
+  reset_meta
+  [[ -r "$file" ]] || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == *=* ]] || continue
+
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    case "$key" in
+      ssh_host) META_SSH_HOST="$value" ;;
+      local_port) META_LOCAL_PORT="$value" ;;
+      remote_host) META_REMOTE_HOST="$value" ;;
+      remote_port) META_REMOTE_PORT="$value" ;;
+      socket) META_SOCKET="$value" ;;
+      created_at) META_CREATED_AT="$value" ;;
+    esac
+  done < "$file"
+
+  [[ -n "$META_SSH_HOST" ]] || return 1
+  validate_port "$META_LOCAL_PORT" || return 1
+  [[ -n "$META_REMOTE_HOST" ]] || return 1
+  validate_port "$META_REMOTE_PORT" || return 1
+  [[ -n "$META_SOCKET" ]] || return 1
+
+  return 0
+}
+
+write_meta() {
+  emulate -L zsh
+  local file="$1"
+  local ssh_host="$2"
+  local local_port="$3"
+  local remote_host="$4"
+  local remote_port="$5"
+  local socket="$6"
+  local created_at
+
+  created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+  {
+    print -r -- "ssh_host=$ssh_host"
+    print -r -- "local_port=$local_port"
+    print -r -- "remote_host=$remote_host"
+    print -r -- "remote_port=$remote_port"
+    print -r -- "socket=$socket"
+    print -r -- "created_at=$created_at"
+  } > "$file"
+}
+
+meta_files() {
+  emulate -L zsh
+  local dir file
+  local -a files
+  dir="$(runtime_dir)"
+  [[ -d "$dir" ]] || return 0
+  files=( "$dir"/*.meta(N) )
+  for file in "${files[@]}"; do
+    print -r -- "$file"
+  done
+}
+
+is_control_alive() {
+  emulate -L zsh
+  local ssh_host="$1"
+  local socket="$2"
+
+  [[ -n "$ssh_host" && -n "$socket" ]] || return 1
+  ssh -S "$socket" -O check "$ssh_host" >/dev/null 2>&1
+}
+
+is_port_listening() {
+  emulate -L zsh
+  local port="$1"
+
+  command -v lsof >/dev/null 2>&1 || return 2
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+port_state() {
+  emulate -L zsh
+  local port="$1"
+
+  if is_port_listening "$port"; then
+    print -r -- "listening"
+  else
+    case $? in
+      1) print -r -- "closed" ;;
+      2) print -r -- "unknown" ;;
+      *) print -r -- "unknown" ;;
+    esac
+  fi
+}
+
+find_meta_by_port() {
+  emulate -L zsh
+  local port="$1"
+  local file
+
+  FOUND_META_FILES=()
+  for file in ${(f)"$(meta_files)"}; do
+    load_meta "$file" || continue
+    [[ "$META_LOCAL_PORT" == "$port" ]] && FOUND_META_FILES+=("$file")
+  done
+}
+
+list_tunnels() {
+  emulate -L zsh
+  local file status target
+
+  printf "%-6s %-10s %-18s %s\n" "PORT" "SSH HOST" "TARGET" "STATUS"
+  for file in ${(f)"$(meta_files)"}; do
+    if ! load_meta "$file"; then
+      print -u2 -r -- "$PROGRAM: skipping invalid metadata: $file"
+      continue
+    fi
+
+    if is_control_alive "$META_SSH_HOST" "$META_SOCKET"; then
+      status="open"
+    else
+      status="stale"
+    fi
+
+    target="$META_REMOTE_HOST:$META_REMOTE_PORT"
+    printf "%-6s %-10s %-18s %s\n" "$META_LOCAL_PORT" "$META_SSH_HOST" "$target" "$status"
+  done
+}
+
+status_tunnels() {
+  emulate -L zsh
+  local file control local_port_state status target
+
+  printf "%-6s %-10s %-18s %-9s %-10s %s\n" "PORT" "SSH HOST" "TARGET" "CONTROL" "LOCAL PORT" "STATUS"
+  for file in ${(f)"$(meta_files)"}; do
+    if ! load_meta "$file"; then
+      print -u2 -r -- "$PROGRAM: skipping invalid metadata: $file"
+      continue
+    fi
+
+    if is_control_alive "$META_SSH_HOST" "$META_SOCKET"; then
+      control="alive"
+    else
+      control="dead"
+    fi
+
+    local_port_state="$(port_state "$META_LOCAL_PORT")"
+    if [[ "$control" == "alive" && "$local_port_state" != "closed" ]]; then
+      status="open"
+    else
+      status="stale"
+    fi
+
+    target="$META_REMOTE_HOST:$META_REMOTE_PORT"
+    printf "%-6s %-10s %-18s %-9s %-10s %s\n" "$META_LOCAL_PORT" "$META_SSH_HOST" "$target" "$control" "$local_port_state" "$status"
+  done
+}
+
+open_tunnel() {
+  emulate -L zsh
+  local spec="$1"
+  local ssh_host local_port remote_host remote_port socket meta file stale_count alive_count
+
+  parse_host_port "$spec"
+  ssh_host="$PARSED_HOST"
+  local_port="$PARSED_PORT"
+  remote_host="localhost"
+  remote_port="$local_port"
+
+  ensure_runtime_dir
+  socket="$(socket_path "$ssh_host" "$local_port")"
+  meta="$(meta_path "$ssh_host" "$local_port")"
+
+  find_meta_by_port "$local_port"
+  stale_count=0
+  alive_count=0
+  for file in "${FOUND_META_FILES[@]}"; do
+    load_meta "$file" || continue
+    if is_control_alive "$META_SSH_HOST" "$META_SOCKET"; then
+      (( alive_count++ ))
+    else
+      (( stale_count++ ))
+    fi
+  done
+
+  (( alive_count == 0 )) || die "local port $local_port is already used by a managed tunnel"
+  (( stale_count == 0 )) || die "stale metadata exists for local port $local_port; run '$PROGRAM prune'"
+
+  if [[ -e "$meta" || -e "$socket" ]]; then
+    die "metadata or socket already exists for $ssh_host:$local_port; run '$PROGRAM prune' if it is stale"
+  fi
+
+  if is_port_listening "$local_port"; then
+    die "local port $local_port is already listening"
+  fi
+
+  ssh -fN -M -S "$socket" -o ExitOnForwardFailure=yes -L "$local_port:$remote_host:$remote_port" "$ssh_host" || \
+    die "failed to open tunnel $ssh_host:$local_port"
+
+  if ! write_meta "$meta" "$ssh_host" "$local_port" "$remote_host" "$remote_port" "$socket"; then
+    ssh -S "$socket" -O exit "$ssh_host" >/dev/null 2>&1
+    die "opened tunnel but failed to write metadata: $meta"
+  fi
+
+  print -r -- "Opened $local_port -> $ssh_host:$remote_host:$remote_port"
+}
+
+close_meta_file() {
+  emulate -L zsh
+  local file="$1"
+
+  load_meta "$file" || die "invalid metadata: $file"
+
+  if ! is_control_alive "$META_SSH_HOST" "$META_SOCKET"; then
+    die "managed tunnel on local port $META_LOCAL_PORT is not alive; run '$PROGRAM prune'"
+  fi
+
+  ssh -S "$META_SOCKET" -O exit "$META_SSH_HOST" >/dev/null 2>&1 || \
+    die "failed to close tunnel on local port $META_LOCAL_PORT"
+
+  rm -f "$file" "$META_SOCKET"
+  print -r -- "Closed $META_LOCAL_PORT -> $META_SSH_HOST:$META_REMOTE_HOST:$META_REMOTE_PORT"
+}
+
+close_tunnel_by_port() {
+  emulate -L zsh
+  local port="$1"
+
+  validate_port "$port" || usage_error "port must be numeric and between 1 and 65535"
+
+  find_meta_by_port "$port"
+  case ${#FOUND_META_FILES[@]} in
+    0) die "no managed tunnel uses local port $port" ;;
+    1) close_meta_file "${FOUND_META_FILES[1]}" ;;
+    *) die "multiple managed tunnels use local port $port; run '$PROGRAM close' and choose one" ;;
+  esac
+}
+
+known_ssh_hosts() {
+  emulate -L zsh
+  local config="$HOME/.ssh/config"
+  local line host i
+  local -a parts
+  local -A seen
+
+  [[ -r "$config" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    parts=( ${(z)line} )
+    (( ${#parts[@]} >= 2 )) || continue
+    [[ "${parts[1]}" == "Host" ]] || continue
+
+    for (( i = 2; i <= ${#parts[@]}; i++ )); do
+      host="${parts[i]}"
+      [[ "$host" == *[\*\?]* ]] && continue
+      [[ -n "${seen[$host]}" ]] && continue
+      seen[$host]=1
+      print -r -- "$host"
+    done
+  done < "$config"
+}
+
+interactive_open() {
+  emulate -L zsh
+  local ssh_host local_port host
+  local -a hosts
+
+  hosts=( ${(f)"$(known_ssh_hosts)"} )
+  if (( ${#hosts[@]} > 0 )); then
+    print -r -- "Known SSH hosts:"
+    for host in "${hosts[@]}"; do
+      print -r -- "  $host"
+    done
+    print -r -- ""
+  fi
+
+  read "ssh_host?SSH host: " || exit 1
+  read "local_port?Port: " || exit 1
+
+  open_tunnel "$ssh_host:$local_port"
+}
+
+interactive_close() {
+  emulate -L zsh
+  local file choice index
+  local -a files
+
+  files=()
+  for file in ${(f)"$(meta_files)"}; do
+    load_meta "$file" || continue
+    files+=("$file")
+    printf "%d) %-6s %s -> %s:%s\n" ${#files[@]} "$META_SSH_HOST" "$META_LOCAL_PORT" "$META_REMOTE_HOST" "$META_REMOTE_PORT"
+  done
+
+  (( ${#files[@]} > 0 )) || die "no managed tunnels to close"
+  print -r -- ""
+  read "choice?Close which tunnel? " || exit 1
+
+  [[ "$choice" == <-> ]] || usage_error "selection must be numeric"
+  (( choice >= 1 && choice <= ${#files[@]} )) || usage_error "selection out of range"
+
+  close_meta_file "${files[$choice]}"
+}
+
+prune_tunnels() {
+  emulate -L zsh
+  local file pruned kept socket
+
+  pruned=0
+  kept=0
+
+  for file in ${(f)"$(meta_files)"}; do
+    if ! load_meta "$file"; then
+      rm -f "$file" "${file:r}.sock"
+      (( pruned++ ))
+      continue
+    fi
+
+    socket="$META_SOCKET"
+    if is_control_alive "$META_SSH_HOST" "$socket"; then
+      (( kept++ ))
+      continue
+    fi
+
+    rm -f "$file" "$socket"
+    (( pruned++ ))
+  done
+
+  printf "Pruned %d stale tunnel(s); kept %d live tunnel(s).\n" "$pruned" "$kept"
+}
+
+main() {
+  emulate -L zsh
+  local command_name="${1:-}"
+
+  [[ -n "$command_name" ]] || usage_error "missing command"
+  shift
+
+  case "$command_name" in
+    help|-h|--help)
+      (( $# == 0 )) || usage_error "too many arguments"
+      usage
+      ;;
+    list)
+      (( $# == 0 )) || usage_error "list takes no arguments"
+      require_command ssh
+      list_tunnels
+      ;;
+    status)
+      (( $# == 0 )) || usage_error "status takes no arguments"
+      require_command ssh
+      status_tunnels
+      ;;
+    open)
+      require_command ssh
+      case $# in
+        0) interactive_open ;;
+        1) open_tunnel "$1" ;;
+        *) usage_error "open takes zero or one argument" ;;
+      esac
+      ;;
+    close)
+      require_command ssh
+      case $# in
+        0) interactive_close ;;
+        1) close_tunnel_by_port "$1" ;;
+        *) usage_error "close takes zero or one argument" ;;
+      esac
+      ;;
+    prune)
+      (( $# == 0 )) || usage_error "prune takes no arguments"
+      require_command ssh
+      prune_tunnels
+      ;;
+    *)
+      usage_error "unknown command: $command_name"
+      ;;
+  esac
+}
+
+main "$@"
