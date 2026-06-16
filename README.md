@@ -91,7 +91,8 @@ Open interactively:
 tunnel open
 ```
 
-The command lists known SSH hosts from `~/.ssh/config`, then prompts:
+The command lists known SSH hosts from `~/.ssh/config`.
+Enter either a printed host index or a full host name, then enter the port:
 
 ```text
 SSH host:
