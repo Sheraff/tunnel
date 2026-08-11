@@ -131,12 +131,14 @@ Open which port?
     22
   > 5743
     8080
+    Enter another port...
 
 Use Up/Down and Enter (Esc to cancel)
 ```
 
 `tunnel open HOST` skips the host prompt and shows the same port picker.
 `tunnel open PORT` skips port discovery and asks which SSH host to use.
+Select `Enter another port...` to type a port that was not discovered.
 `tunnel close` and `tunnel reopen` use the same arrow-key picker.
 
 When input or output is not attached to a terminal, interactive commands retain

@@ -806,14 +806,24 @@ exit 64'
 interactive_open_host() {
   emulate -L zsh
   local ssh_host="$1"
+  local local_port
+  local -a choices
 
   [[ -n "$ssh_host" ]] || usage_error "host must not be empty"
   discover_remote_ports "$ssh_host"
 
   print -r -- "Listening TCP ports on $ssh_host:"
-  select_menu "Open which port?" "${DISCOVERED_PORTS[@]}" || exit 1
+  choices=( "${DISCOVERED_PORTS[@]}" "Enter another port..." )
+  select_menu "Open which port?" "${choices[@]}" || exit 1
 
-  open_tunnel "$ssh_host:${DISCOVERED_PORTS[$SELECTED_INDEX]}"
+  if (( SELECTED_INDEX <= ${#DISCOVERED_PORTS[@]} )); then
+    local_port="${DISCOVERED_PORTS[$SELECTED_INDEX]}"
+  else
+    read "local_port?Port: " || exit 1
+    validate_port "$local_port" || usage_error "port must be numeric and between 1 and 65535"
+  fi
+
+  open_tunnel "$ssh_host:$local_port"
 }
 
 interactive_open_port() {
