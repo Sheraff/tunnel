@@ -9,6 +9,7 @@ It uses SSH control sockets so tunnels can be checked, closed, reopened, and pru
 - `zsh`
 - `ssh`
 - `lsof` optional, used for local port diagnostics when available
+- `ss`, `lsof`, or `netstat` on the SSH host for automatic port discovery
 
 ## Install
 
@@ -31,6 +32,8 @@ cp tunnel /usr/local/bin/tunnel
 tunnel list
 tunnel status
 tunnel open HOST:PORT
+tunnel open HOST
+tunnel open PORT
 tunnel open
 tunnel reopen PORT
 tunnel reopen all
@@ -53,6 +56,18 @@ This runs roughly:
 
 ```bash
 ssh -fN -M -S "$socket" -L 5743:localhost:5743 bee
+```
+
+Discover listening ports on `bee` and choose one:
+
+```bash
+tunnel open bee
+```
+
+Choose a known SSH host for port `5743`:
+
+```bash
+tunnel open 5743
 ```
 
 List managed tunnels:
@@ -105,13 +120,21 @@ Open interactively:
 tunnel open
 ```
 
-The command lists known SSH hosts from `~/.ssh/config`.
-Enter either a printed host index or a full host name, then enter the port:
+With no argument, the command lists known SSH hosts from `~/.ssh/config`.
+Enter either a printed host index or a full host name. The command then discovers
+the host's listening TCP ports and asks which one to open:
 
 ```text
 SSH host:
-Port:
+Listening TCP ports on bee:
+  1) 22
+  2) 5743
+
+Open which port?
 ```
+
+`tunnel open HOST` skips the host prompt and shows the same port picker.
+`tunnel open PORT` skips port discovery and asks which SSH host to use.
 
 Close interactively:
 
@@ -158,6 +181,10 @@ For MVP syntax, `HOST:PORT` means:
 ```text
 localhost:PORT -> HOST:localhost:PORT
 ```
+
+Automatic discovery lists TCP listeners bound to a loopback or wildcard address,
+because those listeners are reachable through the same remote `localhost:PORT`
+target. Address-specific and UDP listeners are not shown.
 
 Before opening, `tunnel` refuses to continue if:
 

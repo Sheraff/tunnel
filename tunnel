@@ -21,6 +21,8 @@ usage() {
   print -r -- "  $PROGRAM list"
   print -r -- "  $PROGRAM status"
   print -r -- "  $PROGRAM open HOST:PORT"
+  print -r -- "  $PROGRAM open HOST"
+  print -r -- "  $PROGRAM open PORT"
   print -r -- "  $PROGRAM open"
   print -r -- "  $PROGRAM reopen PORT"
   print -r -- "  $PROGRAM reopen all"
@@ -558,9 +560,9 @@ known_ssh_hosts() {
   done < "$config"
 }
 
-interactive_open() {
+select_ssh_host() {
   emulate -L zsh
-  local ssh_host local_port i
+  local ssh_host i
   local -a hosts
 
   hosts=( ${(f)"$(known_ssh_hosts)"} )
@@ -573,12 +575,155 @@ interactive_open() {
   fi
 
   read "ssh_host?SSH host: " || exit 1
-  if [[ "$ssh_host" == <-> ]] && (( ssh_host >= 1 && ssh_host <= ${#hosts[@]} )); then
+  [[ -n "$ssh_host" ]] || usage_error "host must not be empty"
+
+  if [[ "$ssh_host" == <-> ]]; then
+    (( ssh_host >= 1 && ssh_host <= ${#hosts[@]} )) || usage_error "host selection out of range"
     ssh_host="${hosts[$ssh_host]}"
   fi
-  read "local_port?Port: " || exit 1
 
-  open_tunnel "$ssh_host:$local_port"
+  SELECTED_SSH_HOST="$ssh_host"
+}
+
+normalize_listener_endpoint() {
+  emulate -L zsh
+  local endpoint="$1"
+  local format="$2"
+  local address port
+
+  NORMALIZED_LISTENER_PORT=""
+
+  if [[ "$format" == "netstat" && "$endpoint" == *.<-> ]]; then
+    port="${endpoint##*.}"
+    address="${endpoint%.*}"
+  else
+    [[ "$endpoint" == *:* ]] || return 1
+    port="${endpoint##*:}"
+    address="${endpoint%:*}"
+  fi
+
+  address="${address#\[}"
+  address="${address%\]}"
+  validate_port "$port" || return 1
+
+  case "$address" in
+    "*"|"0.0.0.0"|"127.0.0.1"|"::"|"::1") ;;
+    *) return 1 ;;
+  esac
+
+  NORMALIZED_LISTENER_PORT="$port"
+}
+
+discover_remote_ports() {
+  emulate -L zsh
+  local ssh_host="$1"
+  local output ssh_status line provider endpoint port
+  local remote_command
+  local -a parts ports
+  local -A seen
+
+  remote_command='LC_ALL=C
+export LC_ALL
+if command -v ss >/dev/null 2>&1; then
+  printf "__TUNNEL_SS__\n"
+  ss -lnt 2>/dev/null
+  exit 0
+fi
+if command -v lsof >/dev/null 2>&1; then
+  printf "__TUNNEL_LSOF__\n"
+  lsof -nP -a -iTCP -sTCP:LISTEN -Fn 2>/dev/null
+  exit 0
+fi
+if command -v netstat >/dev/null 2>&1; then
+  printf "__TUNNEL_NETSTAT__\n"
+  netstat -an 2>/dev/null
+  exit 0
+fi
+exit 64'
+
+  output="$(ssh "$ssh_host" "$remote_command")"
+  ssh_status=$?
+  case "$ssh_status" in
+    0) ;;
+    64) die "cannot discover ports on $ssh_host: remote host requires ss, lsof, or netstat" ;;
+    *) die "failed to discover ports on $ssh_host" ;;
+  esac
+
+  provider=""
+  ports=()
+  for line in ${(f)output}; do
+    case "$line" in
+      "__TUNNEL_SS__") provider="ss"; continue ;;
+      "__TUNNEL_LSOF__") provider="lsof"; continue ;;
+      "__TUNNEL_NETSTAT__") provider="netstat"; continue ;;
+    esac
+
+    [[ -n "$provider" ]] || continue
+    case "$provider" in
+      ss)
+        parts=( ${(z)line} )
+        (( ${#parts[@]} >= 4 )) || continue
+        endpoint="${parts[4]}"
+        ;;
+      lsof)
+        [[ "$line" == n* ]] || continue
+        endpoint="${line#n}"
+        ;;
+      netstat)
+        [[ "$line" == *LISTEN* ]] || continue
+        parts=( ${(z)line} )
+        (( ${#parts[@]} >= 4 )) || continue
+        endpoint="${parts[4]}"
+        ;;
+    esac
+
+    normalize_listener_endpoint "$endpoint" "$provider" || continue
+    port="$NORMALIZED_LISTENER_PORT"
+    [[ -n "${seen[$port]}" ]] && continue
+    seen[$port]=1
+    ports+=("$port")
+  done
+
+  [[ -n "$provider" ]] || die "received an invalid port discovery response from $ssh_host"
+  (( ${#ports[@]} > 0 )) || die "no loopback or wildcard TCP listeners found on $ssh_host"
+  DISCOVERED_PORTS=( ${(on)ports} )
+}
+
+interactive_open_host() {
+  emulate -L zsh
+  local ssh_host="$1"
+  local choice i
+
+  [[ -n "$ssh_host" ]] || usage_error "host must not be empty"
+  discover_remote_ports "$ssh_host"
+
+  print -r -- "Listening TCP ports on $ssh_host:"
+  for (( i = 1; i <= ${#DISCOVERED_PORTS[@]}; i++ )); do
+    print -r -- "  $i) ${DISCOVERED_PORTS[i]}"
+  done
+  print -r -- ""
+  read "choice?Open which port? " || exit 1
+
+  [[ "$choice" == <-> ]] || usage_error "selection must be numeric"
+  (( choice >= 1 && choice <= ${#DISCOVERED_PORTS[@]} )) || usage_error "selection out of range"
+
+  open_tunnel "$ssh_host:${DISCOVERED_PORTS[$choice]}"
+}
+
+interactive_open_port() {
+  emulate -L zsh
+  local local_port="$1"
+
+  validate_port "$local_port" || usage_error "port must be numeric and between 1 and 65535"
+  select_ssh_host
+  open_tunnel "$SELECTED_SSH_HOST:$local_port"
+}
+
+interactive_open() {
+  emulate -L zsh
+
+  select_ssh_host
+  interactive_open_host "$SELECTED_SSH_HOST"
 }
 
 interactive_close() {
@@ -679,7 +824,15 @@ main() {
       require_command ssh
       case $# in
         0) interactive_open ;;
-        1) open_tunnel "$1" ;;
+        1)
+          if [[ "$1" == *:* ]]; then
+            open_tunnel "$1"
+          elif [[ "$1" == <-> ]]; then
+            interactive_open_port "$1"
+          else
+            interactive_open_host "$1"
+          fi
+          ;;
         *) usage_error "open takes zero or one argument" ;;
       esac
       ;;
