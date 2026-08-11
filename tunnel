@@ -535,6 +535,102 @@ close_tunnel_by_port() {
   esac
 }
 
+can_use_arrow_menu() {
+  emulate -L zsh
+  [[ -t 0 && -t 1 && "${TERM:-dumb}" != "dumb" ]]
+}
+
+render_arrow_menu() {
+  emulate -L zsh
+  local selected="$1"
+  local prompt="$2"
+  local item i
+  local -a items
+
+  shift 2
+  items=( "$@" )
+
+  print -r -- "$prompt"
+  for (( i = 1; i <= ${#items[@]}; i++ )); do
+    item="${items[i]}"
+    if (( i == selected )); then
+      print -r -- "  > $item"
+    else
+      print -r -- "    $item"
+    fi
+  done
+  print -n -r -- "Use Up/Down and Enter (Esc to cancel)"
+}
+
+select_menu() {
+  emulate -L zsh
+  local prompt="$1"
+  local choice selected key next direction i
+  local -a items
+
+  shift
+  items=( "$@" )
+  (( ${#items[@]} > 0 )) || return 1
+
+  if ! can_use_arrow_menu; then
+    for (( i = 1; i <= ${#items[@]}; i++ )); do
+      print -r -- "  $i) ${items[i]}"
+    done
+    print -r -- ""
+    read "choice?$prompt " || return 1
+
+    [[ "$choice" == <-> ]] || usage_error "selection must be numeric"
+    (( choice >= 1 && choice <= ${#items[@]} )) || usage_error "selection out of range"
+    SELECTED_INDEX="$choice"
+    return 0
+  fi
+
+  selected=1
+  render_arrow_menu "$selected" "$prompt" "${items[@]}"
+
+  while true; do
+    if ! read -rsk 1 key; then
+      print -r -- ""
+      return 1
+    fi
+
+    case "$key" in
+      $'\r'|$'\n')
+        print -r -- ""
+        SELECTED_INDEX="$selected"
+        return 0
+        ;;
+      $'\e')
+        if ! read -rsk 1 -t 0.2 next; then
+          print -r -- ""
+          return 1
+        fi
+        [[ "$next" == "[" || "$next" == "O" ]] || continue
+        read -rsk 1 -t 0.2 direction || continue
+        case "$direction" in
+          A)
+            if (( selected == 1 )); then
+              selected=${#items[@]}
+            else
+              (( selected-- ))
+            fi
+            ;;
+          B)
+            if (( selected == ${#items[@]} )); then
+              selected=1
+            else
+              (( selected++ ))
+            fi
+            ;;
+          *) continue ;;
+        esac
+        printf "\r\033[%dA" $(( ${#items[@]} + 1 ))
+        render_arrow_menu "$selected" "$prompt" "${items[@]}"
+        ;;
+    esac
+  done
+}
+
 known_ssh_hosts() {
   emulate -L zsh
   local config="$HOME/.ssh/config"
@@ -563,25 +659,43 @@ known_ssh_hosts() {
 select_ssh_host() {
   emulate -L zsh
   local ssh_host i
-  local -a hosts
+  local -a hosts choices
 
   hosts=( ${(f)"$(known_ssh_hosts)"} )
-  if (( ${#hosts[@]} > 0 )); then
-    print -r -- "Known SSH hosts:"
-    for (( i = 1; i <= ${#hosts[@]}; i++ )); do
-      print -r -- "  $i) ${hosts[i]}"
-    done
-    print -r -- ""
+  if ! can_use_arrow_menu; then
+    if (( ${#hosts[@]} > 0 )); then
+      print -r -- "Known SSH hosts:"
+      for (( i = 1; i <= ${#hosts[@]}; i++ )); do
+        print -r -- "  $i) ${hosts[i]}"
+      done
+      print -r -- ""
+    fi
+
+    read "ssh_host?SSH host: " || exit 1
+    [[ -n "$ssh_host" ]] || usage_error "host must not be empty"
+
+    if [[ "$ssh_host" == <-> ]]; then
+      (( ssh_host >= 1 && ssh_host <= ${#hosts[@]} )) || usage_error "host selection out of range"
+      ssh_host="${hosts[$ssh_host]}"
+    fi
+
+    SELECTED_SSH_HOST="$ssh_host"
+    return 0
   fi
 
-  read "ssh_host?SSH host: " || exit 1
+  if (( ${#hosts[@]} == 0 )); then
+    read "ssh_host?SSH host: " || exit 1
+  else
+    choices=( "${hosts[@]}" "Enter another host..." )
+    select_menu "SSH host:" "${choices[@]}" || exit 1
+    if (( SELECTED_INDEX <= ${#hosts[@]} )); then
+      ssh_host="${hosts[$SELECTED_INDEX]}"
+    else
+      read "ssh_host?SSH host: " || exit 1
+    fi
+  fi
+
   [[ -n "$ssh_host" ]] || usage_error "host must not be empty"
-
-  if [[ "$ssh_host" == <-> ]]; then
-    (( ssh_host >= 1 && ssh_host <= ${#hosts[@]} )) || usage_error "host selection out of range"
-    ssh_host="${hosts[$ssh_host]}"
-  fi
-
   SELECTED_SSH_HOST="$ssh_host"
 }
 
@@ -692,22 +806,14 @@ exit 64'
 interactive_open_host() {
   emulate -L zsh
   local ssh_host="$1"
-  local choice i
 
   [[ -n "$ssh_host" ]] || usage_error "host must not be empty"
   discover_remote_ports "$ssh_host"
 
   print -r -- "Listening TCP ports on $ssh_host:"
-  for (( i = 1; i <= ${#DISCOVERED_PORTS[@]}; i++ )); do
-    print -r -- "  $i) ${DISCOVERED_PORTS[i]}"
-  done
-  print -r -- ""
-  read "choice?Open which port? " || exit 1
+  select_menu "Open which port?" "${DISCOVERED_PORTS[@]}" || exit 1
 
-  [[ "$choice" == <-> ]] || usage_error "selection must be numeric"
-  (( choice >= 1 && choice <= ${#DISCOVERED_PORTS[@]} )) || usage_error "selection out of range"
-
-  open_tunnel "$ssh_host:${DISCOVERED_PORTS[$choice]}"
+  open_tunnel "$ssh_host:${DISCOVERED_PORTS[$SELECTED_INDEX]}"
 }
 
 interactive_open_port() {
@@ -728,47 +834,43 @@ interactive_open() {
 
 interactive_close() {
   emulate -L zsh
-  local file choice
-  local -a files
+  local file label
+  local -a files labels
 
   files=()
+  labels=()
   for file in ${(f)"$(meta_files)"}; do
     load_meta "$file" || continue
     files+=("$file")
-    printf "%d) %-6s %s -> %s:%s\n" ${#files[@]} "$META_SSH_HOST" "$META_LOCAL_PORT" "$META_REMOTE_HOST" "$META_REMOTE_PORT"
+    printf -v label "%-6s %s -> %s:%s" "$META_SSH_HOST" "$META_LOCAL_PORT" "$META_REMOTE_HOST" "$META_REMOTE_PORT"
+    labels+=("$label")
   done
 
   (( ${#files[@]} > 0 )) || die "no managed tunnels to close"
-  print -r -- ""
-  read "choice?Close which tunnel? " || exit 1
+  select_menu "Close which tunnel?" "${labels[@]}" || exit 1
 
-  [[ "$choice" == <-> ]] || usage_error "selection must be numeric"
-  (( choice >= 1 && choice <= ${#files[@]} )) || usage_error "selection out of range"
-
-  close_meta_file "${files[$choice]}"
+  close_meta_file "${files[$SELECTED_INDEX]}"
 }
 
 interactive_reopen() {
   emulate -L zsh
-  local file choice
-  local -a files
+  local file label
+  local -a files labels
 
   files=()
+  labels=()
   for file in ${(f)"$(meta_files)"}; do
     load_meta "$file" || continue
     is_control_alive "$META_SSH_HOST" "$META_SOCKET" && continue
     files+=("$file")
-    printf "%d) %-6s %s -> %s:%s\n" ${#files[@]} "$META_SSH_HOST" "$META_LOCAL_PORT" "$META_REMOTE_HOST" "$META_REMOTE_PORT"
+    printf -v label "%-6s %s -> %s:%s" "$META_SSH_HOST" "$META_LOCAL_PORT" "$META_REMOTE_HOST" "$META_REMOTE_PORT"
+    labels+=("$label")
   done
 
   (( ${#files[@]} > 0 )) || die "no stale managed tunnels to reopen"
-  print -r -- ""
-  read "choice?Reopen which tunnel? " || exit 1
+  select_menu "Reopen which tunnel?" "${labels[@]}" || exit 1
 
-  [[ "$choice" == <-> ]] || usage_error "selection must be numeric"
-  (( choice >= 1 && choice <= ${#files[@]} )) || usage_error "selection out of range"
-
-  reopen_meta_file "${files[$choice]}"
+  reopen_meta_file "${files[$SELECTED_INDEX]}"
 }
 
 prune_tunnels() {
